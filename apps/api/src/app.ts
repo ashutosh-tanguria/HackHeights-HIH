@@ -1,45 +1,19 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { errorHandler } from "./middleware/error-handler";
-import {
-  healthRoutes,
-} from "./routes/health";
-import {
-  agentController,
-  scenarioController,
-  testRunController,
-  failureController,
-  reliabilityController,
-  regressionController,
-  traceController,
-  copilotController,
-  gatewayController,
-  bayoraController,
-} from "./controllers";
+import { env } from "./config/env";
+import { auditService } from "./services/audit/audit-service";
+import { Ctx, bayoraRoutes, createCtx } from "./routes/bayora-routes";
 
-export function createApp() {
-  const app = Fastify({
-    logger: true,
+export function createApp(ctx: Ctx = createCtx()) {
+  const app = Fastify({ logger: env.NODE_ENV !== "test", bodyLimit: 256 * 1024 });
+  app.register(cors, { origin: env.CORS_ORIGIN.split(",") });
+  app.setErrorHandler((err: Error & { statusCode?: number }, _req, reply) => {
+    const status = err.statusCode && err.statusCode >= 400 ? err.statusCode : 500;
+    reply.status(status).send({ error: { code: status, message: status === 500 ? "Internal error" : err.message } });
   });
-
-  app.register(cors, {
-    origin: true,
+  app.register(async (instance) => bayoraRoutes(instance, ctx));
+  app.addHook("onReady", async () => {
+    auditService(); // creates the genesis event on first start
   });
-
-  app.setErrorHandler(errorHandler);
-
-  app.register(healthRoutes);
-
-  app.register(agentController);
-  app.register(scenarioController);
-  app.register(testRunController);
-  app.register(failureController);
-  app.register(reliabilityController);
-  app.register(regressionController);
-  app.register(traceController);
-  app.register(copilotController);
-  app.register(gatewayController);
-  app.register(bayoraController);
-
   return app;
 }

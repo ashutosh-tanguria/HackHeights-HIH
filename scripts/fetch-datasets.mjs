@@ -1,237 +1,125 @@
-import * as fs from "fs";
-import * as path from "path";
-import { fileURLToPath } from "url";
-import { createHash } from "crypto";
+#!/usr/bin/env node
+// Downloads small, real subsets of public safety datasets and writes data/benchmarks/manifest.json.
+//   pnpm fetch:datasets
+// Every row records its source URL, original row id, license note and fetch date. The SHA-256 of each prompt is
+// computed HERE, from the downloaded text. Nothing is typed in by hand. If the network fails, the committed
+// manifest is left untouched so the demo still works offline.
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const TARGET_PATH = path.resolve(__dirname, "..", "data", "benchmarks", "manifest.json");
+const here = path.dirname(fileURLToPath(import.meta.url));
+const TARGET_PATH = path.resolve(here, "..", "data", "benchmarks", "manifest.json");
+const PER_DATASET = Number(process.env.PER_DATASET ?? 20);
+const fetchDate = new Date().toISOString();
+const sha = (s) => createHash("sha256").update(s).digest("hex");
 
-function parseCSVLine(line) {
-  const result = [];
-  let current = "";
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"' && line[i + 1] === '"') {
-      current += '"';
-      i++;
-    } else if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim());
-      current = "";
-    } else {
-      current += char;
-    }
+/** RFC 4180 style CSV parser (handles quoted fields with commas, quotes and newlines). */
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cur = "";
+  let q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') q = false;
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(cur); cur = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cur); cur = "";
+      if (row.some((x) => x !== "")) rows.push(row);
+      row = [];
+    } else cur += c;
   }
-  result.push(current.trim());
-  return result;
+  if (cur !== "" || row.length) { row.push(cur); rows.push(row); }
+  return rows;
 }
 
-async function fetchAdvBench(limit = 20) {
+async function get(url, json = false) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(60000) });
+  if (!r.ok) throw new Error(`${url} -> HTTP ${r.status}`);
+  return json ? r.json() : r.text();
+}
+
+function make({ dataset, prefix, category, sourceUrl, license, expected }, rows) {
+  const out = [];
+  for (const { prompt, id, cat } of rows) {
+    const p = (prompt ?? "").trim();
+    if (p.length < 10) continue;
+    out.push({
+      dataset,
+      version: "as-fetched",
+      caseId: `${prefix}-${String(out.length + 1).padStart(4, "0")}`,
+      category: cat || category,
+      sourceUrl,
+      originalRowId: id,
+      prompt: p,
+      promptSha256: sha(p),
+      expected,
+      license,
+      fetchDate,
+    });
+    if (out.length >= PER_DATASET) break;
+  }
+  return out;
+}
+
+async function advbench() {
   const url = "https://raw.githubusercontent.com/llm-attacks/llm-attacks/main/data/advbench/harmful_behaviors.csv";
-  console.log(`[fetch-datasets] Downloading AdvBench from ${url}...`);
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to fetch AdvBench: ${resp.status} ${resp.statusText}`);
-  const text = await resp.text();
-  const lines = text.split("\n").filter((l) => l.trim().length > 0);
-  // header: goal,target
-  const cases = [];
-  const fetchDate = new Date().toISOString();
-
-  for (let i = 1; i < lines.length && cases.length < limit; i++) {
-    const cols = parseCSVLine(lines[i]);
-    const prompt = cols[0];
-    if (!prompt || prompt.length < 10) continue;
-    const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-    const num = (cases.length + 1).toString().padStart(4, "0");
-
-    cases.push({
-      dataset: "AdvBench",
-      version: "1.0.0",
-      caseId: `AB-${num}`,
-      category: "harmful_behaviors",
-      sourceUrl: url,
-      originalRowId: i,
-      prompt,
-      promptSha256,
-      expected: "refuse",
-      license: "MIT (llm-attacks)",
-      fetchDate,
-    });
-  }
-  return cases;
+  const rows = parseCsv(await get(url)).slice(1).map((c, i) => ({ prompt: c[0], id: i + 1 }));
+  return make({ dataset: "AdvBench", prefix: "AB", category: "harmful_behaviors", sourceUrl: url, license: "MIT (llm-attacks)", expected: "refuse" }, rows);
 }
 
-async function fetchHarmBench(limit = 20) {
+async function harmbench() {
   const url = "https://raw.githubusercontent.com/centerforaisafety/HarmBench/main/data/behavior_datasets/harmbench_behaviors_text_all.csv";
-  console.log(`[fetch-datasets] Downloading HarmBench from ${url}...`);
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to fetch HarmBench: ${resp.status} ${resp.statusText}`);
-  const text = await resp.text();
-  const lines = text.split("\n").filter((l) => l.trim().length > 0);
-  // header: Behavior,FunctionalCategory,SemanticCategory,Tags,ContextString,BehaviorID
-  const cases = [];
-  const fetchDate = new Date().toISOString();
-
-  for (let i = 1; i < lines.length && cases.length < limit; i++) {
-    const cols = parseCSVLine(lines[i]);
-    const prompt = cols[0];
-    const category = cols[1] || "cyber_boundary";
-    const behaviorId = cols[5] || `hb_${i}`;
-    if (!prompt || prompt.length < 10) continue;
-    const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-    const num = (cases.length + 1).toString().padStart(4, "0");
-
-    cases.push({
-      dataset: "HarmBench",
-      version: "1.0.0",
-      caseId: `HB-${num}`,
-      category,
-      sourceUrl: url,
-      originalRowId: behaviorId,
-      prompt,
-      promptSha256,
-      expected: "refuse",
-      license: "MIT (Center for AI Safety)",
-      fetchDate,
-    });
-  }
-  return cases;
+  // columns: Behavior,FunctionalCategory,SemanticCategory,Tags,ContextString,BehaviorID
+  const rows = parseCsv(await get(url)).slice(1).filter((c) => c[1] === "standard").map((c) => ({ prompt: c[0], id: c[5], cat: c[2] }));
+  return make({ dataset: "HarmBench", prefix: "HB", category: "harmbench", sourceUrl: url, license: "MIT (Center for AI Safety)", expected: "refuse" }, rows);
 }
 
-async function fetchJailbreakBench(limit = 20) {
-  const url = "https://datasets-server.huggingface.co/rows?dataset=rubend18%2FChatGPT-Jailbreak-Prompts&config=default&split=train&offset=0&limit=30";
-  console.log(`[fetch-datasets] Downloading JailbreakBench (HF ChatGPT-Jailbreaks) from ${url}...`);
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to fetch Jailbreaks: ${resp.status} ${resp.statusText}`);
-  const data = await resp.json();
-  const rows = data.rows || [];
-  const cases = [];
-  const fetchDate = new Date().toISOString();
-
-  for (let i = 0; i < rows.length && cases.length < limit; i++) {
-    const row = rows[i].row;
-    const prompt = (row.Prompt || row.prompt || row.text || "").trim();
-    if (!prompt || prompt.length < 15) continue;
-    const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-    const num = (cases.length + 1).toString().padStart(4, "0");
-
-    cases.push({
-      dataset: "JailbreakBench",
-      version: "1.0.0",
-      caseId: `JB-${num}`,
-      category: "jailbreak_persona",
-      sourceUrl: "https://huggingface.co/datasets/rubend18/ChatGPT-Jailbreak-Prompts",
-      originalRowId: rows[i].row_idx ?? i,
-      prompt,
-      promptSha256,
-      expected: "refuse",
-      license: "Apache-2.0 / Public Domain",
-      fetchDate,
-    });
-  }
-  return cases;
+async function jailbreakbench() {
+  const api = "https://datasets-server.huggingface.co/rows?dataset=JailbreakBench%2FJBB-Behaviors&config=behaviors&split=harmful&offset=0&limit=100";
+  const data = await get(api, true);
+  const rows = (data.rows ?? []).map((r) => ({ prompt: r.row.Goal, id: r.row.Index, cat: r.row.Category }));
+  return make({ dataset: "JailbreakBench", prefix: "JB", category: "jbb_behaviors", sourceUrl: "https://huggingface.co/datasets/JailbreakBench/JBB-Behaviors", license: "MIT (JailbreakBench)", expected: "refuse" }, rows);
 }
 
-async function fetchGandalf(limit = 20) {
-  const url = "https://datasets-server.huggingface.co/rows?dataset=Lakera%2Fgandalf_ignore_instructions&config=default&split=train&offset=0&limit=30";
-  console.log(`[fetch-datasets] Downloading Lakera Gandalf from ${url}...`);
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to fetch Gandalf: ${resp.status} ${resp.statusText}`);
-  const data = await resp.json();
-  const rows = data.rows || [];
-  const cases = [];
-  const fetchDate = new Date().toISOString();
-
-  for (let i = 0; i < rows.length && cases.length < limit; i++) {
-    const row = rows[i].row;
-    const prompt = (row.text || row.prompt || "").trim();
-    if (!prompt || prompt.length < 10) continue;
-    const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-    const num = (cases.length + 1).toString().padStart(4, "0");
-
-    cases.push({
-      dataset: "Lakera_Gandalf",
-      version: "1.0.0",
-      caseId: `GD-${num}`,
-      category: "instruction_injection",
-      sourceUrl: "https://huggingface.co/datasets/Lakera/gandalf_ignore_instructions",
-      originalRowId: rows[i].row_idx ?? i,
-      prompt,
-      promptSha256,
-      expected: "refuse",
-      license: "CC-BY-4.0 (Lakera)",
-      fetchDate,
-    });
-  }
-  return cases;
+async function jailbreakPersonas() {
+  const api = "https://datasets-server.huggingface.co/rows?dataset=rubend18%2FChatGPT-Jailbreak-Prompts&config=default&split=train&offset=0&limit=100";
+  const data = await get(api, true);
+  const rows = (data.rows ?? []).map((r) => ({ prompt: r.row.Prompt ?? r.row.prompt ?? r.row.text, id: r.row_idx }));
+  return make({ dataset: "JailbreakPersonas", prefix: "JP", category: "jailbreak_persona", sourceUrl: "https://huggingface.co/datasets/rubend18/ChatGPT-Jailbreak-Prompts", license: "not stated on dataset card (check before redistributing)", expected: "refuse" }, rows);
 }
 
-async function fetchBenign(limit = 20) {
+async function gandalf() {
+  const api = "https://datasets-server.huggingface.co/rows?dataset=Lakera%2Fgandalf_ignore_instructions&config=default&split=train&offset=0&limit=100";
+  const data = await get(api, true);
+  const rows = (data.rows ?? []).map((r) => ({ prompt: r.row.text, id: r.row_idx }));
+  return make({ dataset: "Lakera_Gandalf", prefix: "GD", category: "instruction_injection", sourceUrl: "https://huggingface.co/datasets/Lakera/gandalf_ignore_instructions", license: "MIT (Lakera)", expected: "refuse" }, rows);
+}
+
+async function benign() {
   const url = "https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/main/alpaca_data.json";
-  console.log(`[fetch-datasets] Downloading Benign prompts from ${url}...`);
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Failed to fetch Benign Alpaca: ${resp.status} ${resp.statusText}`);
-  const items = await resp.json();
-  const cases = [];
-  const fetchDate = new Date().toISOString();
-
-  for (let i = 0; i < items.length && cases.length < limit; i++) {
-    const item = items[i];
-    const prompt = (item.instruction || "").trim();
-    if (!prompt || prompt.length < 10) continue;
-    const promptSha256 = createHash("sha256").update(prompt).digest("hex");
-    const num = (cases.length + 1).toString().padStart(4, "0");
-
-    cases.push({
-      dataset: "Benign_Alpaca",
-      version: "1.0.0",
-      caseId: `BN-${num}`,
-      category: "benign_instruction",
-      sourceUrl: url,
-      originalRowId: i,
-      prompt,
-      promptSha256,
-      expected: "comply",
-      license: "CC-BY-NC 4.0 (Stanford Alpaca)",
-      fetchDate,
-    });
-  }
-  return cases;
+  const items = await get(url, true);
+  const rows = items.map((it, i) => ({ prompt: it.input ? "" : it.instruction, id: i })); // instruction-only rows: self-contained prompts
+  return make({ dataset: "Benign_Alpaca", prefix: "BN", category: "benign_instruction", sourceUrl: url, license: "CC-BY-NC-4.0 (Stanford Alpaca)", expected: "comply" }, rows);
 }
 
-async function main() {
-  console.log("[fetch-datasets] Starting authoritative dataset fetch...");
-  try {
-    const [adv, harm, jb, gandalf, benign] = await Promise.all([
-      fetchAdvBench(20),
-      fetchHarmBench(20),
-      fetchJailbreakBench(20),
-      fetchGandalf(20),
-      fetchBenign(20),
-    ]);
-
-    const allCases = [...adv, ...harm, ...jb, ...gandalf, ...benign];
-    console.log(`[fetch-datasets] Successfully collected ${allCases.length} total benchmark prompts.`);
-
-    const dir = path.dirname(TARGET_PATH);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    fs.writeFileSync(TARGET_PATH, JSON.stringify(allCases, null, 2), "utf-8");
-    console.log(`[fetch-datasets] Manifest written to ${TARGET_PATH}`);
-  } catch (err) {
-    console.error(`[fetch-datasets] ERROR: Network error while downloading authoritative datasets.`);
-    console.error(err.message);
-    if (!fs.existsSync(TARGET_PATH)) {
-      process.exit(1);
-    } else {
-      console.log(`[fetch-datasets] Committed manifest exists; leaving intact.`);
-    }
-  }
+try {
+  console.log("[fetch-datasets] downloading...");
+  const sets = await Promise.all([advbench(), harmbench(), jailbreakbench(), jailbreakPersonas(), gandalf(), benign()]);
+  const all = sets.flat();
+  for (const s of sets) console.log(`  ${s[0]?.dataset ?? "?"}: ${s.length} rows`);
+  fs.mkdirSync(path.dirname(TARGET_PATH), { recursive: true });
+  fs.writeFileSync(TARGET_PATH, JSON.stringify(all, null, 2) + "\n", "utf-8");
+  console.log(`[fetch-datasets] wrote ${all.length} rows to ${TARGET_PATH}`);
+} catch (err) {
+  console.error(`[fetch-datasets] FAILED: ${err.message}`);
+  console.error(fs.existsSync(TARGET_PATH) ? "[fetch-datasets] keeping the committed manifest (offline mode)." : "[fetch-datasets] no committed manifest exists.");
+  process.exit(fs.existsSync(TARGET_PATH) ? 0 : 1);
 }
-
-main();

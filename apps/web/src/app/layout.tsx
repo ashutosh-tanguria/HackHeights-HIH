@@ -1,22 +1,19 @@
 import type { Metadata } from "next";
+import { IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
-import { BayoraProvider } from "@/lib/bayora-store";
+
+const ui = IBM_Plex_Sans({ subsets: ["latin"], weight: ["400", "500", "600", "700"], variable: "--font-ui", display: "swap" });
+const code = JetBrains_Mono({ subsets: ["latin"], weight: ["400", "600"], variable: "--font-code", display: "swap" });
 
 export const metadata: Metadata = {
-  title: "BAYORA | Secure Adversarial AI Safety Testing Platform",
-  description: "Trustworthy Infrastructure for AI Safety Testing. Policy-enforced sandbox isolation for Red Team, Blue Team, and Target LLM environments.",
+  title: "Bayora console",
+  description: "Isolation, measurement and audit console for adversarial AI safety testing (Hack in Hills, PS-04)",
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="en" className="dark">
-      <body className="min-h-screen bg-slate-950 text-slate-100 antialiased selection:bg-cyan-500 selection:text-black">
-        <BayoraProvider>{children}</BayoraProvider>
-      </body>
+    <html lang="en" className={`${ui.variable} ${code.variable}`}>
+      <body>{children}</body>
     </html>
   );
 }

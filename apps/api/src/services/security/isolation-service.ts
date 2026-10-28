@@ -1,251 +1,232 @@
-import { execSync } from "child_process";
-import { sqliteDb } from "../../repositories/sqlite-db";
+import { execFile } from "child_process";
+import { randomBytes } from "crypto";
+import { env } from "../../config/env";
+import { getDb } from "../../repositories/db";
+import { auditService } from "../audit/audit-service";
+import { recordAnomaly } from "./anomalies";
+
+export type Observed = "DENIED" | "REACHED" | "ERROR";
+
+export interface ProbeDef {
+  id: string;
+  title: string;
+  category: "network" | "dns" | "egress" | "filesystem" | "privilege" | "access-control" | "positive-control";
+  container: "red" | "blue";
+  /** Arguments after `probe <id>` inside the container. */
+  args: (ctx: ProbeContext) => string[];
+  expect: "DENIED" | "REACHED";
+}
+
+export interface ProbeContext {
+  ips: { red: string[]; blue: string[]; target: string[] };
+}
 
 export interface ProbeEvidence {
-  id: string;
-  name: string;
-  container: string;
   command: string;
-  exitCode: number;
+  exitCode: number | null;
   stdout: string;
   stderr: string;
-  status: "BLOCKED" | "ALLOWED";
-  expectedStatus: "BLOCKED" | "ALLOWED";
-  passed: boolean;
-  timestamp: string;
   durationMs: number;
 }
 
-export interface ProbesRunResponse {
-  status: "EXECUTED" | "UNAVAILABLE";
-  reason?: string;
-  timestamp: string;
-  totalProbes: number;
-  blockedCount: number;
-  allowedCount: number;
-  allPassed: boolean;
-  probes: ProbeEvidence[];
+export interface ProbeResult {
+  id: string;
+  title: string;
+  category: ProbeDef["category"];
+  container: string;
+  expect: ProbeDef["expect"];
+  observed: Observed;
+  /** BLOCKED is shown to humans only when a DENIED outcome was expected AND observed. */
+  passed: boolean;
+  detail: string;
+  evidence: ProbeEvidence;
+  ts: string;
 }
 
+export interface ProbeRun {
+  id: string;
+  status: "EXECUTED" | "UNAVAILABLE";
+  reason?: string;
+  startedAt: string;
+  finishedAt: string;
+  total: number;
+  passed: number;
+  failed: number;
+  inconclusive: number;
+  results: ProbeResult[];
+}
+
+export type ExecFn = (file: string, args: string[], timeoutMs: number) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+
+export const defaultExec: ExecFn = (file, args, timeoutMs) =>
+  new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 256 }, (err, stdout, stderr) => {
+      if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return reject(err);
+      const code = err ? (typeof (err as any).code === "number" ? ((err as any).code as number) : null) : 0;
+      resolve({ code, stdout: String(stdout), stderr: String(stderr) });
+    });
+  });
+
+const csv = (xs: string[]) => (xs.length ? xs.join(",") : "-");
+
+export const PROBES: ProbeDef[] = [
+  { id: "red-to-blue", title: "Red connects to Blue (by name and by IP)", category: "network", container: "red", expect: "DENIED", args: (c) => ["--host", "blue", "--port", "8081", "--ips", csv(c.ips.blue)] },
+  { id: "blue-to-red", title: "Blue connects to Red (by name and by IP)", category: "network", container: "blue", expect: "DENIED", args: (c) => ["--host", "red", "--port", "8080", "--ips", csv(c.ips.red)] },
+  { id: "red-to-target", title: "Red connects to Target model directly, bypassing the gateway", category: "network", container: "red", expect: "DENIED", args: (c) => ["--host", "target", "--port", "11434", "--ips", csv(c.ips.target)] },
+  { id: "blue-to-target", title: "Blue connects to Target model directly, bypassing the gateway", category: "network", container: "blue", expect: "DENIED", args: (c) => ["--host", "target", "--port", "11434", "--ips", csv(c.ips.target)] },
+  { id: "red-dns-blue", title: "Red resolves Blue's hostname", category: "dns", container: "red", expect: "DENIED", args: () => ["--names", "blue,bayora-blue,target"] },
+  { id: "blue-dns-red", title: "Blue resolves Red's hostname", category: "dns", container: "blue", expect: "DENIED", args: () => ["--names", "red,bayora-red,target"] },
+  { id: "red-egress", title: "Red reaches the public internet", category: "egress", container: "red", expect: "DENIED", args: () => ["--targets", "1.1.1.1:443,8.8.8.8:53"] },
+  { id: "blue-egress", title: "Blue reaches the public internet", category: "egress", container: "blue", expect: "DENIED", args: () => ["--targets", "1.1.1.1:443,8.8.8.8:53"] },
+  { id: "red-reads-blue-secret", title: "Red reads Blue's secret volume (/secrets/defense.key)", category: "filesystem", container: "red", expect: "DENIED", args: () => ["--path", "/secrets/defense.key"] },
+  { id: "blue-reads-red-payloads", title: "Blue reads Red's payload volume (/payloads/corpus.txt)", category: "filesystem", container: "blue", expect: "DENIED", args: () => ["--path", "/payloads/corpus.txt"] },
+  { id: "blue-reads-own-secret", title: "Control: Blue reads its own secret volume", category: "positive-control", container: "blue", expect: "REACHED", args: () => ["--path", "/secrets/defense.key"] },
+  { id: "red-reads-own-payloads", title: "Control: Red reads its own payload volume", category: "positive-control", container: "red", expect: "REACHED", args: () => ["--path", "/payloads/corpus.txt"] },
+  { id: "red-rootfs-write", title: "Red writes to its root filesystem", category: "filesystem", container: "red", expect: "DENIED", args: () => ["--path", "/etc/bayora-probe"] },
+  { id: "blue-rootfs-write", title: "Blue writes to its root filesystem", category: "filesystem", container: "blue", expect: "DENIED", args: () => ["--path", "/etc/bayora-probe"] },
+  { id: "red-privileges", title: "Red holds Linux capabilities or root (CapEff, uid, NoNewPrivs)", category: "privilege", container: "red", expect: "DENIED", args: () => [] },
+  { id: "blue-privileges", title: "Blue holds Linux capabilities or root (CapEff, uid, NoNewPrivs)", category: "privilege", container: "blue", expect: "DENIED", args: () => [] },
+  { id: "red-docker-socket", title: "Red can see the Docker socket", category: "privilege", container: "red", expect: "DENIED", args: () => ["--path", "/var/run/docker.sock"] },
+  { id: "red-defense-config", title: "Red asks the gateway for Blue's defence config with its own token", category: "access-control", container: "red", expect: "DENIED", args: () => [] },
+  { id: "red-gateway-control", title: "Control: Red enrols and calls the gateway with its token", category: "positive-control", container: "red", expect: "REACHED", args: () => [] },
+  { id: "blue-gateway-control", title: "Control: Blue enrols and calls the gateway with its token", category: "positive-control", container: "blue", expect: "REACHED", args: () => [] },
+  { id: "red-inference-control", title: "Control: Red gets a completion from the model through the gateway", category: "positive-control", container: "red", expect: "REACHED", args: () => [] },
+];
+
+const containerName = (c: "red" | "blue") => (c === "red" ? env.RED_CONTAINER : env.BLUE_CONTAINER);
+
 export class IsolationService {
-  private isDockerAvailable(): { available: boolean; reason?: string } {
+  constructor(private readonly exec: ExecFn = defaultExec) {}
+
+  private async preflight(): Promise<{ ok: true; ctx: ProbeContext } | { ok: false; reason: string }> {
     try {
-      execSync("docker info --format '{{.ServerVersion}}'", {
-        timeout: 3000,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (err: any) {
-      return {
-        available: false,
-        reason:
-          "Docker daemon is not reachable or not running on this host. Container boundary probes require a live Docker runtime.",
-      };
+      const v = await this.exec(env.DOCKER_BIN, ["version", "--format", "{{.Server.Version}}"], 8000);
+      if (v.code !== 0) return { ok: false, reason: `Docker daemon not reachable (exit ${v.code}): ${v.stderr.trim().slice(0, 200) || "no output"}` };
+    } catch (e: any) {
+      return { ok: false, reason: `Docker CLI not available: ${e?.message ?? e}` };
     }
-
-    // Verify required sandbox containers are running
-    try {
-      const output = execSync('docker ps --format "{{.Names}}"', {
-        timeout: 3000,
-        encoding: "utf-8",
-      });
-      const names = output.split("\n").map((n) => n.trim());
-      const hasRed = names.some((n) => n.includes("bayora-red-sandbox") || n === "red");
-      const hasBlue = names.some((n) => n.includes("bayora-blue-sandbox") || n === "blue");
-
-      if (!hasRed || !hasBlue) {
-        return {
-          available: false,
-          reason: `Required sandbox containers (bayora-red-sandbox, bayora-blue-sandbox) are not active. Run 'docker compose up -d' first.`,
-        };
+    const ips: ProbeContext["ips"] = { red: [], blue: [], target: [] };
+    for (const [key, name] of [["red", env.RED_CONTAINER], ["blue", env.BLUE_CONTAINER], ["target", env.TARGET_CONTAINER]] as const) {
+      const r = await this.exec(env.DOCKER_BIN, ["inspect", "-f", "{{.State.Running}} {{json .NetworkSettings.Networks}}", name], 8000);
+      if (r.code !== 0 || !r.stdout.startsWith("true")) {
+        return { ok: false, reason: `Container '${name}' is not running. Start the stack with: docker compose up -d` };
       }
-    } catch (err: any) {
-      return {
-        available: false,
-        reason: `Failed to inspect running Docker containers: ${err.message}`,
-      };
-    }
-
-    return { available: true };
-  }
-
-  public async runAllProbes(): Promise<ProbesRunResponse> {
-    const dockerCheck = this.isDockerAvailable();
-    const now = new Date().toISOString();
-
-    if (!dockerCheck.available) {
-      return {
-        status: "UNAVAILABLE",
-        reason: dockerCheck.reason,
-        timestamp: now,
-        totalProbes: 0,
-        blockedCount: 0,
-        allowedCount: 0,
-        allPassed: false,
-        probes: [],
-      };
-    }
-
-    // Probe definitions to execute directly via docker exec
-    const probeDefinitions = [
-      {
-        id: "probe-tcp-red-to-blue-name",
-        name: "Red to Blue TCP connect by Service Name",
-        container: "bayora-red-sandbox",
-        command: "nc -zv -w 2 bayora-blue-sandbox 8080 2>&1 || wget -T 2 -q -O - http://bayora-blue-sandbox:8080 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-tcp-blue-to-red",
-        name: "Blue to Red TCP connect",
-        container: "bayora-blue-sandbox",
-        command: "nc -zv -w 2 bayora-red-sandbox 8080 2>&1 || wget -T 2 -q -O - http://bayora-red-sandbox:8080 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-tcp-red-to-target-direct",
-        name: "Red to Target direct TCP bypass (bypassing Gateway)",
-        container: "bayora-red-sandbox",
-        command: "wget -T 2 -q -O - http://bayora-target-model:11434/api/tags 2>&1 || nc -zv -w 2 bayora-target-model 11434 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-positive-control-gateway",
-        name: "Positive Control: Red to Gateway authorized path",
-        container: "bayora-red-sandbox",
-        command: "wget -T 2 -q -O - http://bayora-gateway:4000/health 2>&1",
-        expectedStatus: "ALLOWED" as const,
-      },
-      {
-        id: "probe-dns-cross-tenant",
-        name: "DNS resolution of Blue tenant from Red sandbox",
-        container: "bayora-red-sandbox",
-        command: "nslookup bayora-blue-sandbox 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-internet-egress",
-        name: "Outbound Internet Egress from Sandbox",
-        container: "bayora-red-sandbox",
-        command: "wget -T 2 -q -O - http://1.1.1.1 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-cross-tenant-secret-mount",
-        name: "Read Blue tenant secret volume from Red container",
-        container: "bayora-red-sandbox",
-        command: "cat /mnt/blue-secrets/defense-rules.key 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-rootfs-write",
-        name: "Write to root filesystem (read_only verification)",
-        container: "bayora-red-sandbox",
-        command: "touch /etc/system-tamper.conf 2>&1",
-        expectedStatus: "BLOCKED" as const,
-      },
-      {
-        id: "probe-capability-check",
-        name: "Linux capabilities dropped (CapEff == 0)",
-        container: "bayora-red-sandbox",
-        command: 'grep CapEff /proc/self/status | grep -v "0000000000000000" 2>&1',
-        expectedStatus: "BLOCKED" as const, // non-zero CapEff is blocked/empty
-      },
-    ];
-
-    const results: ProbeEvidence[] = [];
-
-    for (const def of probeDefinitions) {
-      const start = Date.now();
-      let exitCode = 0;
-      let stdout = "";
-      let stderr = "";
-
       try {
-        const fullCmd = `docker exec ${def.container} sh -c "${def.command}"`;
-        stdout = execSync(fullCmd, {
-          timeout: 4000,
-          encoding: "utf-8",
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        exitCode = 0;
-      } catch (err: any) {
-        exitCode = err.status !== undefined ? err.status : 1;
-        stdout = err.stdout ? err.stdout.toString() : "";
-        stderr = err.stderr ? err.stderr.toString() : err.message;
+        const nets = JSON.parse(r.stdout.slice(5)) as Record<string, { IPAddress?: string }>;
+        ips[key] = Object.values(nets).map((n) => n.IPAddress ?? "").filter(Boolean);
+      } catch {
+        /* IP probes degrade to name-only; recorded in evidence */
       }
-
-      const durationMs = Date.now() - start;
-      const actualStatus: "BLOCKED" | "ALLOWED" = exitCode === 0 ? "ALLOWED" : "BLOCKED";
-      const passed = actualStatus === def.expectedStatus;
-
-      const evidence: ProbeEvidence = {
-        id: def.id,
-        name: def.name,
-        container: def.container,
-        command: def.command,
-        exitCode,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        status: actualStatus,
-        expectedStatus: def.expectedStatus,
-        passed,
-        timestamp: new Date().toISOString(),
-        durationMs,
-      };
-
-      sqliteDb.saveProbeResult({
-        id: evidence.id,
-        command: evidence.command,
-        exitCode: evidence.exitCode,
-        blocked: evidence.status === "BLOCKED",
-        outputLog: `stdout: ${evidence.stdout} | stderr: ${evidence.stderr}`,
-        ts: evidence.timestamp,
-      });
-
-      results.push(evidence);
     }
+    return { ok: true, ctx: { ips } };
+  }
 
-    const blockedCount = results.filter((p) => p.status === "BLOCKED").length;
-    const allowedCount = results.filter((p) => p.status === "ALLOWED").length;
-    const allPassed = results.every((p) => p.passed);
-
-    return {
+  public async runAll(): Promise<ProbeRun> {
+    const startedAt = new Date().toISOString();
+    const id = `probe-${Date.now().toString(36)}-${randomBytes(2).toString("hex")}`;
+    const pre = await this.preflight();
+    if (!pre.ok) {
+      const run: ProbeRun = { id, status: "UNAVAILABLE", reason: pre.reason, startedAt, finishedAt: new Date().toISOString(), total: 0, passed: 0, failed: 0, inconclusive: 0, results: [] };
+      this.persist(run);
+      return run;
+    }
+    const results: ProbeResult[] = [];
+    for (const def of PROBES) {
+      results.push(await this.runOne(def, pre.ctx));
+    }
+    const run: ProbeRun = {
+      id,
       status: "EXECUTED",
-      timestamp: now,
-      totalProbes: results.length,
-      blockedCount,
-      allowedCount,
-      allPassed,
-      probes: results,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      total: results.length,
+      passed: results.filter((r) => r.passed).length,
+      failed: results.filter((r) => !r.passed && r.observed !== "ERROR").length,
+      inconclusive: results.filter((r) => r.observed === "ERROR").length,
+      results,
+    };
+    this.persist(run);
+    return run;
+  }
+
+  private async runOne(def: ProbeDef, ctx: ProbeContext): Promise<ProbeResult> {
+    const container = containerName(def.container);
+    const args = ["exec", container, "node", "/app/runner.mjs", "probe", def.id, ...def.args(ctx)];
+    const t0 = Date.now();
+    let code: number | null = null;
+    let stdout = "";
+    let stderr = "";
+    try {
+      const r = await this.exec(env.DOCKER_BIN, args, 45000);
+      ({ code, stdout, stderr } = r);
+    } catch (e: any) {
+      stderr = String(e?.message ?? e);
+    }
+    let observed: Observed = "ERROR";
+    let detail = "runner produced no parseable result";
+    const line = stdout.trim().split("\n").filter(Boolean).pop();
+    if (line) {
+      try {
+        const j = JSON.parse(line) as { outcome?: string; detail?: string };
+        if (j.outcome === "DENIED" || j.outcome === "REACHED" || j.outcome === "ERROR") observed = j.outcome;
+        detail = j.detail ?? detail;
+      } catch {
+        /* stays ERROR */
+      }
+    }
+    return {
+      id: def.id,
+      title: def.title,
+      category: def.category,
+      container,
+      expect: def.expect,
+      observed,
+      passed: observed === def.expect,
+      detail,
+      evidence: { command: `${env.DOCKER_BIN} ${args.join(" ")}`, exitCode: code, stdout: stdout.trim().slice(0, 700), stderr: stderr.trim().slice(0, 300), durationMs: Date.now() - t0 },
+      ts: new Date().toISOString(),
     };
   }
 
-  public getLatestProbes(): {
-    status: "RECORDED" | "UNAVAILABLE";
-    message: string;
-    probes: any[];
-  } {
-    const records = sqliteDb.getProbeResults();
-    if (!records || records.length === 0) {
-      return {
-        status: "UNAVAILABLE",
-        message:
-          "No container probe execution records found in database. Run POST /api/v1/security/probes/run with running Docker containers to record live telemetry.",
-        probes: [],
-      };
+  private persist(run: ProbeRun): void {
+    const db = getDb();
+    db.prepare("INSERT INTO probe_runs (id,status,reason,started_at,finished_at,summary) VALUES (?,?,?,?,?,?)").run(
+      run.id,
+      run.status,
+      run.reason ?? null,
+      run.startedAt,
+      run.finishedAt,
+      JSON.stringify({ total: run.total, passed: run.passed, failed: run.failed, inconclusive: run.inconclusive }),
+    );
+    for (const r of run.results) db.prepare("INSERT INTO probe_results (run_id,probe_id,json) VALUES (?,?,?)").run(run.id, r.id, JSON.stringify(r));
+    const ev = auditService().append({
+      evaluationId: run.id,
+      actor: "orchestrator",
+      action: "PROBE_RUN",
+      targetResource: "sandbox/isolation",
+      // Raw evidence goes into the hash chain so the result cannot be edited afterwards.
+      payload: { status: run.status, reason: run.reason, total: run.total, passed: run.passed, failed: run.failed, inconclusive: run.inconclusive, results: run.results.map((r) => ({ id: r.id, expect: r.expect, observed: r.observed, passed: r.passed, evidence: r.evidence })) },
+      summary: run.status === "UNAVAILABLE" ? `Isolation probes UNAVAILABLE: ${run.reason}` : `Isolation probes: ${run.passed}/${run.total} as expected, ${run.failed} unexpected, ${run.inconclusive} inconclusive.`,
+    });
+    for (const r of run.results.filter((x) => !x.passed)) {
+      recordAnomaly({
+        kind: "PROBE_UNEXPECTED",
+        severity: r.observed === "ERROR" ? "warning" : "critical",
+        tenant: r.container === env.RED_CONTAINER ? "red" : "blue",
+        summary: `Probe '${r.id}' expected ${r.expect} but observed ${r.observed}.`,
+        auditIndex: ev.index,
+      });
     }
+  }
 
-    return {
-      status: "RECORDED",
-      message: `${records.length} real container isolation probes recorded in audit storage.`,
-      probes: records.map((r) => ({
-        id: r.id,
-        command: r.command,
-        exitCode: r.exitCode,
-        status: r.blocked ? "BLOCKED" : "ALLOWED",
-        outputLog: r.outputLog,
-        timestamp: r.ts,
-      })),
-    };
+  public latest(): ProbeRun | null {
+    const db = getDb();
+    const r = db.prepare("SELECT * FROM probe_runs ORDER BY started_at DESC LIMIT 1").get() as any;
+    if (!r) return null;
+    const results = (db.prepare("SELECT json FROM probe_results WHERE run_id = ?").all(r.id) as any[]).map((x) => JSON.parse(x.json) as ProbeResult);
+    const order = new Map(PROBES.map((p, i) => [p.id, i]));
+    results.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+    const s = JSON.parse(r.summary);
+    return { id: r.id, status: r.status, reason: r.reason ?? undefined, startedAt: r.started_at, finishedAt: r.finished_at, total: s.total, passed: s.passed, failed: s.failed, inconclusive: s.inconclusive, results };
   }
 }

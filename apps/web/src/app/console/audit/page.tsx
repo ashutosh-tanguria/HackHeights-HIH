@@ -1,200 +1,114 @@
 "use client";
-
 import { useState } from "react";
-import { useBayora } from "@/lib/bayora-store";
-import {
-  FileCheck,
-  ShieldCheck,
-  ShieldAlert,
-  CheckCircle2,
-  XCircle,
-  RotateCcw,
-  Download,
-  AlertTriangle,
-  Lock,
-  Layers,
-  Terminal,
-  Hash,
-} from "lucide-react";
+import { api, useApi } from "@/lib/api-client";
+import type { Anomaly, AuditEvent, AuditVerify, TamperResult } from "@/lib/types";
+import { Async, Badge, Banner, Button, Card, PageHeader, Stat, fmtTime } from "@/components/ui";
+
+function Step({ label, ok, text }: { label: string; ok: boolean; text: string }) {
+  const c = ok ? "var(--ok)" : "var(--bad)";
+  return (
+    <div className="min-w-[160px] rounded-xl border bg-[var(--panel-2)] px-5 py-4" style={{ borderColor: c }}>
+      <div className="label">{label}</div>
+      <div className="mt-1 text-[28px] font-bold tabular-nums" style={{ color: c }}>{text}</div>
+    </div>
+  );
+}
+const Arrow = () => <div className="flex items-center text-2xl text-[var(--muted)]" aria-hidden="true">→</div>;
 
 export default function AuditPage() {
-  const {
-    auditEvents,
-    verifyAuditChainAction,
-    tamperAuditBlockAction,
-    restoreAuditChainAction,
-    auditVerificationReport,
-    evaluations,
-    activeEvaluationId,
-  } = useBayora();
+  const events = useApi<{ total: number; events: AuditEvent[] }>("/api/v1/audit?limit=100", { pollMs: 8000 });
+  const verify = useApi<AuditVerify>("/api/v1/audit/verify", { pollMs: 8000 });
+  const anomalies = useApi<Anomaly[]>("/api/v1/anomalies", { pollMs: 8000 });
+  const [tamper, setTamper] = useState<TamperResult | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-  const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
+  async function runTamper() {
+    setBusy(true);
+    setErr(null);
+    const r = await api<TamperResult>("/api/v1/audit/tamper-demo", { method: "POST", body: {} });
+    if (r.ok) setTamper(r.data);
+    else setErr(r.error);
+    setBusy(false);
+    void events.refresh();
+    void verify.refresh();
+  }
 
-  const activeEval = evaluations.find((e) => e.id === activeEvaluationId) || evaluations[0];
-
-  const handleVerify = async () => {
-    const report = await verifyAuditChainAction();
-    if (report.isValid) {
-      setVerifyMessage("Cryptographic verification passed. All SHA-256 hashes match linear predecessor chain.");
-    } else {
-      setVerifyMessage(`INTEGRITY FAILURE: Block #${report.brokenIndex} does not match computed hash! Audit tampering detected.`);
-    }
-  };
-
-  const handleExportCapsule = () => {
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(activeEval.reproducibilityCapsule, null, 2));
-    const downloadAnchor = document.createElement("a");
-    downloadAnchor.setAttribute("href", dataStr);
-    downloadAnchor.setAttribute("download", `bayora-capsule-${activeEval.id}.json`);
-    document.body.appendChild(downloadAnchor);
-    downloadAnchor.click();
-    downloadAnchor.remove();
-  };
-
+  const v = verify.data;
   return (
-    <div className="space-y-8 max-w-7xl mx-auto">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 text-xs font-mono font-bold border border-emerald-800">
-              MOMENT 3: VERIFIED
-            </span>
-            <span className="text-xs text-slate-400 font-mono">CRYPTOGRAPHIC FORENSICS</span>
-          </div>
-          <h1 className="text-2xl font-extrabold text-white mt-1 flex items-center gap-2.5">
-            <FileCheck className="h-6 w-6 text-emerald-400" />
-            <span>Forensic Audit Trail & Cryptographic Hash Chain</span>
-          </h1>
-          <p className="text-xs text-slate-400 mt-1 max-w-3xl">
-            Every boundary test, gateway invocation, and policy decision is linked in an immutable SHA-256 linear hash chain sealed with an offline Ed25519 root signature.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-3">
-          <button
-            onClick={handleVerify}
-            className="px-4 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono font-bold text-xs transition-all flex items-center gap-2 shadow-lg shadow-emerald-500/20"
-          >
-            <CheckCircle2 className="h-4 w-4" />
-            <span>Verify Audit Chain</span>
-          </button>
-
-          <button
-            onClick={handleExportCapsule}
-            className="px-4 py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 font-mono text-xs transition-all flex items-center gap-2"
-          >
-            <Download className="h-4 w-4" />
-            <span>Export Capsule</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Verification Status Alert */}
-      {verifyMessage && (
-        <div
-          className={`p-4 rounded-xl border font-mono text-xs flex items-center gap-3 ${
-            auditVerificationReport.isValid
-              ? "bg-emerald-950/80 border-emerald-800 text-emerald-300"
-              : "bg-rose-950/80 border-rose-800 text-rose-300"
-          }`}
-        >
-          {auditVerificationReport.isValid ? (
-            <CheckCircle2 className="h-5 w-5 text-emerald-400 flex-shrink-0" />
-          ) : (
-            <XCircle className="h-5 w-5 text-rose-400 flex-shrink-0" />
-          )}
-          <span>{verifyMessage}</span>
-        </div>
-      )}
-
-      {/* Interactive Tampering Demo Controls */}
-      <div className="p-6 rounded-2xl bg-slate-900/90 border border-slate-800 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div>
-            <h2 className="text-base font-bold text-white flex items-center gap-2">
-              <Hash className="h-4 w-4 text-cyan-400" />
-              <span>Interactive Tampering Proof Demo</span>
-            </h2>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Simulate an adversary attempting to modify an event record in the database. Watch cryptographic verification immediately fail at the exact tampered block.
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => tamperAuditBlockAction(3)}
-              className="px-3 py-1.5 rounded-lg bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-800 font-mono text-xs font-semibold transition-colors"
-            >
-              Tamper Block #3
-            </button>
-            <button
-              onClick={restoreAuditChainAction}
-              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-mono text-xs transition-colors flex items-center gap-1.5"
-            >
-              <RotateCcw className="h-3 w-3" />
-              <span>Restore Clean Chain</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Live Hash Chain Blocks */}
-      <div className="space-y-4">
-        <div className="flex items-center justify-between text-xs font-mono text-slate-400 uppercase font-semibold">
-          <span>Linear Audit Blocks ({auditEvents.length} Sealed Events)</span>
-          <span className="text-cyan-400">Formula: H_i = SHA256(H_(i-1) || payload_i)</span>
-        </div>
-
-        <div className="space-y-3">
-          {auditEvents.map((evt, idx) => (
-            <div
-              key={evt.eventId}
-              className={`p-4 rounded-xl border font-mono text-xs transition-all ${
-                evt.isTampered
-                  ? "bg-rose-950/40 border-rose-600 shadow-lg shadow-rose-950/40"
-                  : "bg-slate-900/80 border-slate-800"
-              }`}
-            >
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
-                <div className="flex items-center gap-2">
-                  <span className="px-2 py-0.5 rounded bg-slate-950 text-cyan-400 font-bold border border-slate-800 text-[11px]">
-                    BLOCK #{evt.index}
-                  </span>
-                  <span className="text-white font-bold">{evt.eventId}</span>
-                  <span className="text-slate-400">• {evt.actor.toUpperCase()}</span>
-                </div>
-                <div className="flex items-center gap-2 text-[10px]">
-                  <span className="text-slate-400">{evt.timestamp}</span>
-                  {evt.isTampered ? (
-                    <span className="px-2 py-0.5 rounded bg-rose-950 text-rose-300 font-bold border border-rose-700 animate-pulse">
-                      TAMPERED
-                    </span>
-                  ) : (
-                    <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 font-bold border border-emerald-800">
-                      VALID
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              <div className="text-slate-300 font-sans text-xs mb-3">
-                {evt.payloadSummary}
-              </div>
-
-              {/* Hash Link Visualization */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-[10px] text-slate-400 bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-                <div className="truncate">
-                  <span className="text-slate-500">PREV HASH:</span> <span className="text-slate-400">{evt.previousHash}</span>
-                </div>
-                <div className="truncate">
-                  <span className="text-slate-500">CURR HASH:</span> <span className="text-emerald-400 font-bold">{evt.currentHash}</span>
-                </div>
-              </div>
+    <>
+      <PageHeader title="Audit" tagline="SHA-256 hash chain in SQLite, Ed25519 signed checkpoints, independently verifiable export.">
+        <Button kind="ghost" onClick={() => { void verify.refresh(); void events.refresh(); }}>Verify now</Button>
+        <Button kind="danger" onClick={runTamper} disabled={busy}>{busy ? "Tampering…" : "Run tamper demo"}</Button>
+        <a className="rounded-md border border-[var(--line-2)] px-3.5 py-2 text-[13px] font-semibold text-[var(--ink)] no-underline hover:bg-[var(--panel-2)]" href="/api/bayora/api/v1/audit/export" download="bayora-audit-bundle.json">Export bundle</a>
+      </PageHeader>
+      {err ? <Banner tone="bad" title="Tamper demo failed">{err}</Banner> : null}
+      <Async loading={verify.loading} error={verify.error}>
+        {v ? (
+          <Card title="Chain verification">
+            <div className="flex flex-wrap items-center gap-10">
+              <Stat label="Hash chain" value={v.isValid ? <Badge tone="ok">VERIFIED</Badge> : <Badge tone="bad">FAIL at #{v.brokenIndex}</Badge>} sub={`${v.totalEvents} events`} />
+              <Stat label="Ed25519 checkpoints" value={v.checkpointsValid ? <Badge tone="ok">VALID</Badge> : <Badge tone="bad">INVALID</Badge>} sub={`${v.checkpoints.length} signed · key ${v.publicKeyFingerprint}`} />
+              <div className="mono text-[var(--muted)]" title={v.head}>head {v.head.slice(0, 12)}…{v.head.slice(-8)}</div>
             </div>
-          ))}
-        </div>
-      </div>
-    </div>
+            {v.reason ? <p className="mt-2 text-[var(--bad)]">{v.reason}</p> : null}
+            <p className="mt-3 text-[13px] text-[var(--muted)]">Offline check: save the export as bundle.json, then run <code>node scripts/verify-bundle.mjs bundle.json</code>. It needs neither the API nor the database.</p>
+          </Card>
+        ) : null}
+      </Async>
+
+      {tamper ? (
+        <Card title="Tamper demo result">
+          {tamper.status === "UNAVAILABLE" ? <Banner title="UNAVAILABLE">{tamper.reason}</Banner> : (
+            <>
+              <div className="flex flex-wrap items-stretch gap-3">
+                <Step label="Before" ok={!!tamper.before?.valid} text={tamper.before?.valid ? "PASS" : "FAIL"} />
+                <Arrow />
+                <Step label="During tamper" ok={!!tamper.during?.valid} text={tamper.during?.valid ? "PASS" : `FAIL @ #${tamper.during?.brokenIndex}`} />
+                <Arrow />
+                <Step label="Restored" ok={!!tamper.after?.valid} text={tamper.after?.valid ? "PASS" : "FAIL"} />
+              </div>
+              <p className="mt-4 text-[13.5px]">Mutation: <span className="mono">{tamper.mutation}</span> (event #{tamper.tamperedIndex}). <span className="text-[var(--muted)]">{tamper.during?.reason}</span></p>
+            </>
+          )}
+        </Card>
+      ) : null}
+
+      <Card title="Anomaly feed (payloads redacted)">
+        <Async loading={anomalies.loading} error={anomalies.error}>
+          {(anomalies.data ?? []).length === 0 ? <p className="text-[var(--muted)]">No anomalies recorded.</p> : (
+            <table>
+              <thead><tr><th>Time</th><th>Kind</th><th>Severity</th><th>Tenant</th><th>Summary</th></tr></thead>
+              <tbody>
+                {(anomalies.data ?? []).map((a) => (
+                  <tr key={a.id}><td className="whitespace-nowrap">{fmtTime(a.ts)}</td><td className="mono">{a.kind}</td><td><Badge tone={a.severity === "critical" ? "bad" : a.severity === "warning" ? "warn" : "neutral"}>{a.severity}</Badge></td><td>{a.tenant}</td><td>{a.summary}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Async>
+      </Card>
+
+      <Card title={`Latest events (${events.data?.total ?? 0} total)`}>
+        <Async loading={events.loading} error={events.error}>
+          <ol className="relative ml-2 border-l border-[var(--line-2)]">
+            {[...(events.data?.events ?? [])].reverse().map((e) => (
+              <li key={e.index} className="relative mb-3 ml-5">
+                <span className="absolute -left-[26px] top-3 h-2.5 w-2.5 rounded-full bg-[var(--accent)] ring-4 ring-[var(--panel)]" aria-hidden="true" />
+                <div className="rounded-lg border border-[var(--line)] bg-[var(--panel-2)] px-4 py-2.5">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span className="mono font-semibold text-[var(--accent)]">#{e.index}</span>
+                    <span className="mono">{e.action}</span>
+                    <span className="text-xs text-[var(--muted)]">{e.actor} · {fmtTime(e.timestamp)}</span>
+                    <span className="mono ml-auto text-[var(--muted)]" title={e.currentHash}>{e.currentHash.slice(0, 8)}…{e.currentHash.slice(-6)}</span>
+                  </div>
+                  <div className="mt-1 text-[13.5px]">{e.payloadSummary}</div>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </Async>
+      </Card>
+    </>
   );
 }

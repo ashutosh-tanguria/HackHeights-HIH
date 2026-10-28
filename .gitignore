@@ -43,3 +43,6 @@ coverage/
 .vercel
 .env*
 !.env.example
+.bayora/
+bayora-audit-bundle.json
+*.sqlite*

@@ -1,347 +1,255 @@
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { AuditEvent, computeAuditNodeHash, verifyChainIntegrity, VerificationReport } from "./hash-chain";
-import { sqliteDb } from "../../repositories/sqlite-db";
+import { env } from "../../config/env";
+import { getDb } from "../../repositories/db";
+import {
+  AuditActor,
+  AuditEvent,
+  GENESIS_PREV_HASH,
+  VerificationReport,
+  computeAuditNodeHash,
+  verifyChainIntegrity,
+} from "./hash-chain";
+
+export interface Checkpoint {
+  id: string;
+  eventIndex: number;
+  chainHead: string;
+  signature: string; // "ed25519:<hex>"
+  publicKey: string; // SPKI PEM
+  createdAt: string;
+}
+
+export interface NewAuditEvent {
+  evaluationId: string;
+  actor: AuditActor;
+  action: string;
+  targetResource: string;
+  /** Object is JSON-stringified. Never put raw Red payloads or Blue rules in here: store hashes. */
+  payload: unknown;
+  summary: string;
+}
+
+const CHECKPOINT_EVERY = 10;
+
+function loadKeyPair(): { publicKey: string; privateKey: string } {
+  const dir = path.resolve(process.cwd(), env.DATA_DIR);
+  const file = path.join(dir, "audit-keypair.json");
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, "utf-8"));
+    if (saved.publicKey && saved.privateKey) return saved;
+  } catch {
+    /* generate below */
+  }
+  const kp = crypto.generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+  if (process.env.BAYORA_DB_PATH !== ":memory:") {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(kp, null, 2), { mode: 0o600 });
+  }
+  return kp;
+}
+
+type Row = Record<string, any>;
+
+function rowToEvent(r: Row): AuditEvent {
+  return {
+    index: Number(r.idx),
+    id: r.id,
+    timestamp: r.timestamp,
+    evaluationId: r.evaluation_id,
+    actor: r.actor,
+    action: r.action,
+    targetResource: r.target_resource,
+    canonicalPayload: r.canonical_payload,
+    payloadSummary: r.payload_summary,
+    previousHash: r.prev_hash,
+    currentHash: r.hash,
+  };
+}
 
 export class AuditService {
-  private events: AuditEvent[] = [];
-  private ed25519KeyPair: { publicKey: string; privateKey: string };
-  private keyFilePath: string;
+  private keys = loadKeyPair();
 
-  constructor() {
-    const keyDir = path.resolve(process.cwd(), ".bayora");
-    if (!fs.existsSync(keyDir)) {
-      fs.mkdirSync(keyDir, { recursive: true });
-    }
-    this.keyFilePath = path.join(keyDir, "audit-keypair.json");
-    this.ed25519KeyPair = this.loadOrGenerateKeyPair();
-    this.initChain();
-  }
-
-  private loadOrGenerateKeyPair(): { publicKey: string; privateKey: string } {
-    try {
-      if (fs.existsSync(this.keyFilePath)) {
-        const saved = JSON.parse(fs.readFileSync(this.keyFilePath, "utf-8"));
-        if (saved.publicKey && saved.privateKey) {
-          return saved;
-        }
-      }
-    } catch (err) {
-      console.warn("[AuditService] Could not read saved keypair, generating fresh one:", err);
-    }
-
-    const generated = crypto.generateKeyPairSync("ed25519", {
-      publicKeyEncoding: { type: "spki", format: "pem" },
-      privateKeyEncoding: { type: "pkcs8", format: "pem" },
-    });
-
-    try {
-      fs.writeFileSync(
-        this.keyFilePath,
-        JSON.stringify({ publicKey: generated.publicKey, privateKey: generated.privateKey }, null, 2),
-        "utf-8"
-      );
-    } catch (err) {
-      console.warn("[AuditService] Failed to persist keypair to disk:", err);
-    }
-
-    return generated;
-  }
-
-  private initChain() {
-    const dbEvents = sqliteDb.getAuditEvents();
-    const GENESIS_PREV_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
-    if (
-      dbEvents &&
-      dbEvents.length > 0 &&
-      dbEvents[0].index === 0 &&
-      dbEvents[0].prevHash === GENESIS_PREV_HASH
-    ) {
-      this.events = dbEvents.map((r) => ({
-        index: r.index,
-        id: r.id,
-        timestamp: r.timestamp,
-        evaluationId: r.evaluationId,
-        actor: r.actor as any,
-        action: r.action as any,
-        targetResource: r.targetResource,
-        canonicalPayload: r.canonicalPayload,
-        payloadSummary: r.payloadSummary,
-        previousHash: r.prevHash,
-        currentHash: r.hash,
-      }));
-    } else {
-      this.initGenesisChain();
-    }
-  }
-
-  public initGenesisChain() {
-    sqliteDb.clearAuditEvents();
-    this.events = [];
-    const genesisPrev = "0000000000000000000000000000000000000000000000000000000000000000";
-
-    const initialDefs: Array<Omit<AuditEvent, "index" | "currentHash" | "previousHash">> = [
-      {
-        id: "evt-001",
-        timestamp: "2026-10-28 00:00:00 UTC",
-        evaluationId: "EVAL-2026-INIT",
-        actor: "orchestrator",
-        action: "EVALUATION_INIT",
-        targetResource: "bayora-cluster/init",
-        canonicalPayload: JSON.stringify({ mode: "adversarial-blindbox", seed: 9412, target: "qwen2.5:0.5b" }),
-        payloadSummary: "Genesis audit event: Evaluation initialized with seed 9412.",
-      },
-      {
-        id: "evt-002",
-        timestamp: "2026-10-28 00:00:02 UTC",
-        evaluationId: "EVAL-2026-INIT",
-        actor: "orchestrator",
-        action: "SANDBOX_ATTACH",
-        targetResource: "docker/network/red_net",
-        canonicalPayload: JSON.stringify({ runtime: "hardened-container", rootfs: "read-only", capDrop: ["ALL"] }),
-        payloadSummary: "Red Sandbox attached with cap_drop ALL and read-only rootfs.",
-      },
-      {
-        id: "evt-003",
-        timestamp: "2026-10-28 00:00:05 UTC",
-        evaluationId: "EVAL-2026-INIT",
-        actor: "bayora-gateway",
-        action: "POLICY_COMPILED",
-        targetResource: "network/isolation",
-        canonicalPayload: JSON.stringify({ ingress: ["gateway:4000"], egress: "deny-all" }),
-        payloadSummary: "Network isolation active: Default-deny with gateway-only access.",
-      },
-    ];
-
-    let lastHash = genesisPrev;
-    for (let i = 0; i < initialDefs.length; i++) {
-      const def = initialDefs[i];
-      const partial = {
-        ...def,
-        index: i,
-        previousHash: lastHash,
-      };
-      const currentHash = computeAuditNodeHash(partial);
-      const fullEvent: AuditEvent = { ...partial, currentHash };
-      this.events.push(fullEvent);
-      lastHash = currentHash;
-
-      sqliteDb.insertAuditEvent({
-        idx: fullEvent.index,
-        id: fullEvent.id,
-        timestamp: fullEvent.timestamp,
-        evaluationId: fullEvent.evaluationId,
-        actor: fullEvent.actor,
-        action: fullEvent.action,
-        targetResource: fullEvent.targetResource,
-        canonicalPayload: fullEvent.canonicalPayload,
-        payloadSummary: fullEvent.payloadSummary,
-        prevHash: fullEvent.previousHash,
-        hash: fullEvent.currentHash,
-      });
-    }
-
-    this.createSignedCheckpoint();
-  }
-
+  /** Always reads from SQLite so the verifier sees what is actually stored. */
   public getEvents(): AuditEvent[] {
-    return this.events;
+    return (getDb().prepare("SELECT * FROM audit_events ORDER BY idx ASC").all() as Row[]).map(rowToEvent);
+  }
+
+  public count(): number {
+    return Number((getDb().prepare("SELECT COUNT(*) AS c FROM audit_events").get() as Row).c);
   }
 
   public getHeadHash(): string {
-    return this.events.length > 0 ? this.events[this.events.length - 1].currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
+    const r = getDb().prepare("SELECT hash FROM audit_events ORDER BY idx DESC LIMIT 1").get() as Row | undefined;
+    return r ? r.hash : GENESIS_PREV_HASH;
   }
 
-  public appendEvent(eventData: Omit<AuditEvent, "index" | "currentHash" | "previousHash">): AuditEvent {
-    const lastEvent = this.events[this.events.length - 1];
-    const previousHash = lastEvent ? lastEvent.currentHash : "0000000000000000000000000000000000000000000000000000000000000000";
-    const index = this.events.length;
-
+  public append(e: NewAuditEvent): AuditEvent {
+    const db = getDb();
+    const last = db.prepare("SELECT idx, hash FROM audit_events ORDER BY idx DESC LIMIT 1").get() as Row | undefined;
+    const index = last ? Number(last.idx) + 1 : 0;
     const partial = {
-      ...eventData,
       index,
-      previousHash,
+      id: `evt-${index}-${crypto.randomBytes(4).toString("hex")}`,
+      timestamp: new Date().toISOString(),
+      evaluationId: e.evaluationId,
+      actor: e.actor,
+      action: e.action,
+      targetResource: e.targetResource,
+      canonicalPayload: typeof e.payload === "string" ? e.payload : JSON.stringify(e.payload),
+      payloadSummary: e.summary,
+      previousHash: last ? (last.hash as string) : GENESIS_PREV_HASH,
     };
-    const currentHash = computeAuditNodeHash(partial);
-    const newEvent: AuditEvent = { ...partial, currentHash };
-    this.events.push(newEvent);
-
-    // Persist to SQLite
-    sqliteDb.insertAuditEvent({
-      idx: newEvent.index,
-      id: newEvent.id,
-      timestamp: newEvent.timestamp,
-      evaluationId: newEvent.evaluationId,
-      actor: newEvent.actor,
-      action: newEvent.action,
-      targetResource: newEvent.targetResource,
-      canonicalPayload: newEvent.canonicalPayload,
-      payloadSummary: newEvent.payloadSummary,
-      prevHash: newEvent.previousHash,
-      hash: newEvent.currentHash,
-    });
-
-    if (this.events.length % 5 === 0) {
-      this.createSignedCheckpoint();
-    }
-
-    return newEvent;
+    const ev: AuditEvent = { ...partial, currentHash: computeAuditNodeHash(partial) };
+    db.prepare(
+      `INSERT INTO audit_events (idx,id,timestamp,evaluation_id,actor,action,target_resource,canonical_payload,payload_summary,prev_hash,hash)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(ev.index, ev.id, ev.timestamp, ev.evaluationId, ev.actor, ev.action, ev.targetResource, ev.canonicalPayload, ev.payloadSummary, ev.previousHash, ev.currentHash);
+    if ((index + 1) % CHECKPOINT_EVERY === 0) this.createCheckpoint();
+    return ev;
   }
 
-  public createSignedCheckpoint(): { id: string; chainHead: string; signature: string; publicKey: string } {
-    const head = this.getHeadHash();
-    const eventIndex = Math.max(0, this.events.length - 1);
-    const signPayload = Buffer.from(`${eventIndex}:${head}`);
-    const signature = crypto.sign(null, signPayload, this.ed25519KeyPair.privateKey).toString("hex");
+  /** Records the chain start once, with the real time it happened. */
+  public ensureGenesis(): void {
+    if (this.count() === 0) {
+      this.append({
+        evaluationId: "SYSTEM",
+        actor: "orchestrator",
+        action: "CHAIN_GENESIS",
+        targetResource: "audit/chain",
+        payload: { note: "audit chain created", publicKeyFingerprint: this.publicKeyFingerprint() },
+        summary: "Audit chain created.",
+      });
+      this.createCheckpoint();
+    }
+  }
 
-    const chk = {
-      id: `chk-${Date.now()}`,
+  public publicKeyFingerprint(): string {
+    return crypto.createHash("sha256").update(this.keys.publicKey).digest("hex").slice(0, 16);
+  }
+
+  public createCheckpoint(): Checkpoint {
+    const eventIndex = Math.max(0, this.count() - 1);
+    const chainHead = this.getHeadHash();
+    const sig = crypto.sign(null, Buffer.from(`${eventIndex}:${chainHead}`), this.keys.privateKey).toString("hex");
+    const chk: Checkpoint = {
+      id: `chk-${eventIndex}-${crypto.randomBytes(3).toString("hex")}`,
       eventIndex,
-      chainHead: head,
-      signature: `ed25519:${signature}`,
-      publicKey: this.ed25519KeyPair.publicKey,
+      chainHead,
+      signature: `ed25519:${sig}`,
+      publicKey: this.keys.publicKey,
       createdAt: new Date().toISOString(),
     };
-
-    sqliteDb.saveCheckpoint(chk);
+    getDb()
+      .prepare("INSERT INTO checkpoints (id,event_index,chain_head,signature,public_key,created_at) VALUES (?,?,?,?,?,?)")
+      .run(chk.id, chk.eventIndex, chk.chainHead, chk.signature, chk.publicKey, chk.createdAt);
     return chk;
   }
 
-  public verifyIntegrity(): VerificationReport {
-    return verifyChainIntegrity(this.events);
+  public getCheckpoints(): Checkpoint[] {
+    return (getDb().prepare("SELECT * FROM checkpoints ORDER BY event_index ASC, created_at ASC").all() as Row[]).map((r) => ({
+      id: r.id,
+      eventIndex: Number(r.event_index),
+      chainHead: r.chain_head,
+      signature: r.signature,
+      publicKey: r.public_key,
+      createdAt: r.created_at,
+    }));
   }
 
-  public verifyChainStatus(): {
-    valid: boolean;
-    brokenAt: number | null;
-    head: string;
-    checkpointSignature: string;
-    publicKey: string;
-    totalEvents: number;
-    reason?: string;
-  } {
-    const report = this.verifyIntegrity();
-    const latestChk = sqliteDb.getLatestCheckpoint() || this.createSignedCheckpoint();
+  /** Checks every stored checkpoint: Ed25519 signature AND that it still matches the chain. */
+  public verifyCheckpoints(chain: AuditEvent[], checkpoints: Checkpoint[]) {
+    return checkpoints.map((c) => {
+      let signatureValid = false;
+      try {
+        signatureValid = crypto.verify(null, Buffer.from(`${c.eventIndex}:${c.chainHead}`), c.publicKey, Buffer.from(c.signature.replace(/^ed25519:/, ""), "hex"));
+      } catch {
+        signatureValid = false;
+      }
+      const ev = chain[c.eventIndex];
+      const matchesChain = !!ev && ev.currentHash === c.chainHead;
+      return { id: c.id, eventIndex: c.eventIndex, signatureValid, matchesChain };
+    });
+  }
+
+  public verify(): VerificationReport & { checkpoints: ReturnType<AuditService["verifyCheckpoints"]>; head: string; publicKeyFingerprint: string; checkpointsValid: boolean } {
+    const chain = this.getEvents();
+    const report = verifyChainIntegrity(chain);
+    const checkpoints = this.verifyCheckpoints(chain, this.getCheckpoints());
+    const checkpointsValid = checkpoints.every((c) => c.signatureValid && c.matchesChain);
     return {
-      valid: report.isValid,
-      brokenAt: report.brokenIndex,
+      ...report,
+      isValid: report.isValid && checkpointsValid,
+      reason: report.reason ?? (checkpointsValid ? undefined : "A signed checkpoint no longer matches the chain."),
+      checkpoints,
+      checkpointsValid,
       head: this.getHeadHash(),
-      checkpointSignature: latestChk.signature,
-      publicKey: this.ed25519KeyPair.publicKey,
-      totalEvents: this.events.length,
-      reason: report.reason,
+      publicKeyFingerprint: this.publicKeyFingerprint(),
     };
   }
 
   /**
-   * Tamper Demo: tampers a COPY of the audit chain (or demo record) to prove
-   * that single-character corruption flips verification RED at the exact broken index,
-   * while the original production chain remains 100% intact.
+   * Real tamper demo: edits one stored row in SQLite, verifies (expect FAIL at that index),
+   * restores the original bytes, verifies again (expect PASS). Runs synchronously so no
+   * other request can append or verify while the row is altered.
    */
-  public tamperDemo(indexToTamper: number = 1): {
-    copyBrokenAt: number;
-    originalValid: boolean;
-    tamperedHash: string;
-    expectedHash: string;
-    reason: string;
-  } {
-    const copy: AuditEvent[] = JSON.parse(JSON.stringify(this.events));
-    const targetIdx = Math.min(Math.max(0, indexToTamper), copy.length - 1);
-
-    // Tamper one byte in the copy payload
-    copy[targetIdx].canonicalPayload = copy[targetIdx].canonicalPayload + "_TAMPERED";
-
-    const copyReport = verifyChainIntegrity(copy);
-    const originalReport = this.verifyIntegrity();
-
+  public tamperDemo(requestedIndex?: number) {
+    const db = getDb();
+    const n = this.count();
+    if (n < 2) {
+      return { status: "UNAVAILABLE" as const, reason: "Need at least 2 audit events to demonstrate tampering." };
+    }
+    const index = Math.min(Math.max(1, requestedIndex ?? Math.floor(n / 2)), n - 1);
+    const orig = db.prepare("SELECT canonical_payload FROM audit_events WHERE idx = ?").get(index) as Row;
+    const before = this.verify();
+    db.prepare("UPDATE audit_events SET canonical_payload = ? WHERE idx = ?").run(orig.canonical_payload + " ", index);
+    let during;
+    try {
+      during = this.verify();
+    } finally {
+      db.prepare("UPDATE audit_events SET canonical_payload = ? WHERE idx = ?").run(orig.canonical_payload, index);
+    }
+    const after = this.verify();
     return {
-      copyBrokenAt: copyReport.brokenIndex ?? targetIdx,
-      originalValid: originalReport.isValid,
-      tamperedHash: copy[targetIdx].currentHash,
-      expectedHash: computeAuditNodeHash(copy[targetIdx]),
-      reason: copyReport.reason || "Cryptographic digest mismatch detected.",
+      status: "EXECUTED" as const,
+      tamperedIndex: index,
+      mutation: "appended one space character to canonical_payload of the stored row",
+      before: { valid: before.isValid, brokenIndex: before.brokenIndex },
+      during: { valid: during.isValid, brokenIndex: during.brokenIndex, reason: during.reason },
+      after: { valid: after.isValid, brokenIndex: after.brokenIndex },
+      restored: after.isValid,
     };
   }
 
-  /**
-   * Provenance Bundle Export:
-   * Returns a complete, self-contained audit package including chain, checkpoints,
-   * public key, and a standalone JavaScript verification runner.
-   */
-  public exportProvenanceBundle(): {
-    bundleVersion: string;
-    exportedAt: string;
-    publicKey: string;
-    chainHead: string;
-    totalEvents: number;
-    chain: AuditEvent[];
-    checkpoints: any[];
-    verificationScript: string;
-  } {
-    const latestChk = sqliteDb.getLatestCheckpoint() || this.createSignedCheckpoint();
-    const standaloneScript = `
-/**
- * Standalone Offline Bayora Chain Verifier
- * Run with: node verify-offline.js
- */
-const crypto = require("crypto");
-const fs = require("fs");
-
-function verifyBundle(bundle) {
-  const chain = bundle.chain;
-  console.log("Verifying " + chain.length + " audit chain events...");
-  const GENESIS = "0000000000000000000000000000000000000000000000000000000000000000";
-
-  for (let i = 0; i < chain.length; i++) {
-    const ev = chain[i];
-    if (i === 0 && ev.previousHash !== GENESIS) {
-      console.error("FAIL: Genesis prevHash mismatch");
-      return false;
-    }
-    if (i > 0 && ev.previousHash !== chain[i - 1].currentHash) {
-      console.error("FAIL: Chain link broken at index " + i);
-      return false;
-    }
-    const content = ev.index + "|" + ev.timestamp + "|" + ev.evaluationId + "|" + ev.actor + "|" + ev.action + "|" + ev.targetResource + "|" + ev.canonicalPayload + "|" + ev.previousHash;
-    const computed = crypto.createHash("sha256").update(content).digest("hex");
-    if (computed !== ev.currentHash) {
-      console.error("FAIL: Payload mismatch at index " + i);
-      return false;
-    }
-  }
-
-  console.log("PASS: Linear SHA-256 hash chain 100% verified.");
-  
-  // Verify latest Ed25519 checkpoint signature
-  if (bundle.checkpoints && bundle.checkpoints.length > 0) {
-    const chk = bundle.checkpoints[bundle.checkpoints.length - 1];
-    const sigHex = chk.signature.replace(/^ed25519:/, "");
-    const data = Buffer.from(chk.eventIndex + ":" + chk.chainHead);
-    const validSig = crypto.verify(null, data, chk.publicKey, Buffer.from(sigHex, "hex"));
-    console.log("Ed25519 Checkpoint Signature Valid: " + validSig);
-  }
-  return true;
-}
-
-if (require.main === module) {
-  const bundle = JSON.parse(fs.readFileSync("provenance-bundle.json", "utf-8"));
-  process.exit(verifyBundle(bundle) ? 0 : 1);
-}
-module.exports = { verifyBundle };
-    `.trim();
-
+  public exportBundle() {
+    const chain = this.getEvents();
+    const checkpoints = this.getCheckpoints();
     return {
-      bundleVersion: "1.0.0",
+      bundleVersion: 1,
       exportedAt: new Date().toISOString(),
-      publicKey: this.ed25519KeyPair.publicKey,
+      hashInput: "index|timestamp|evaluationId|actor|action|targetResource|canonicalPayload|previousHash",
+      publicKey: this.keys.publicKey,
       chainHead: this.getHeadHash(),
-      totalEvents: this.events.length,
-      chain: this.events,
-      checkpoints: [latestChk],
-      verificationScript: standaloneScript,
+      totalEvents: chain.length,
+      chain,
+      checkpoints,
+      verifyWith: "node scripts/verify-bundle.mjs <bundle.json>",
     };
   }
 }
 
-export const auditService = new AuditService();
+let _audit: AuditService | null = null;
+export function auditService(): AuditService {
+  if (!_audit) {
+    _audit = new AuditService();
+    _audit.ensureGenesis();
+  }
+  return _audit;
+}
+export function resetAuditServiceForTests(): void {
+  _audit = null;
+}

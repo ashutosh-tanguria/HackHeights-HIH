@@ -1,106 +1,62 @@
-const API_BASE_URL =
-  process.env.NEXT_PUBLIC_API_URL ??
-  "http://127.0.0.1:4000";
+"use client";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-type RequestOptions = RequestInit & {
-  token?: string;
-};
-
-async function request<T>(
-  path: string,
-  options: RequestOptions = {},
-): Promise<T> {
-  const { token, headers, ...requestOptions } =
-    options;
-
-  const response = await fetch(
-    `${API_BASE_URL}${path}`,
-    {
-      ...requestOptions,
-      headers: {
-        "Content-Type": "application/json",
-        ...(token
-          ? {
-              Authorization: `Bearer ${token}`,
-            }
-          : {}),
-        ...headers,
-      },
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `API request failed: ${response.status} ${response.statusText}`,
-    );
-  }
-
-  return response.json() as Promise<T>;
+export interface ApiResult<T> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+  error: string | null;
 }
 
-export const apiClient = {
-  get<T>(
-    path: string,
-    options?: RequestOptions,
-  ) {
-    return request<T>(path, {
-      ...options,
-      method: "GET",
+/** All requests go through the console's server-side proxy (/api/bayora/*), which attaches the admin key. */
+export async function api<T>(path: string, init?: { method?: "GET" | "POST"; body?: unknown }): Promise<ApiResult<T>> {
+  try {
+    const r = await fetch(`/api/bayora${path}`, {
+      method: init?.method ?? "GET",
+      headers: { "content-type": "application/json" },
+      body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+      cache: "no-store",
     });
-  },
+    const text = await r.text();
+    let json: unknown = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      /* non-JSON body */
+    }
+    const message = (json as { error?: { message?: string } } | null)?.error?.message;
+    return { ok: r.ok, status: r.status, data: (json as T) ?? null, error: r.ok ? null : message ?? `HTTP ${r.status}` };
+  } catch (e) {
+    return { ok: false, status: 0, data: null, error: `Network error: ${(e as Error).message}` };
+  }
+}
 
-  post<T>(
-    path: string,
-    body?: unknown,
-    options?: RequestOptions,
-  ) {
-    return request<T>(path, {
-      ...options,
-      method: "POST",
-      body:
-        body !== undefined
-          ? JSON.stringify(body)
-          : undefined,
-    });
-  },
+export function useApi<T>(path: string | null, opts: { pollMs?: number } = {}) {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(path !== null);
+  const alive = useRef(true);
 
-  put<T>(
-    path: string,
-    body?: unknown,
-    options?: RequestOptions,
-  ) {
-    return request<T>(path, {
-      ...options,
-      method: "PUT",
-      body:
-        body !== undefined
-          ? JSON.stringify(body)
-          : undefined,
-    });
-  },
+  const refresh = useCallback(async () => {
+    if (!path) return;
+    const r = await api<T>(path);
+    if (!alive.current) return;
+    setLoading(false);
+    if (r.ok) {
+      setData(r.data);
+      setError(null);
+    } else setError(r.error);
+  }, [path]);
 
-  patch<T>(
-    path: string,
-    body?: unknown,
-    options?: RequestOptions,
-  ) {
-    return request<T>(path, {
-      ...options,
-      method: "PATCH",
-      body:
-        body !== undefined
-          ? JSON.stringify(body)
-          : undefined,
-    });
-  },
+  useEffect(() => {
+    alive.current = true;
+    void refresh();
+    const t = opts.pollMs ? setInterval(() => void refresh(), opts.pollMs) : null;
+    return () => {
+      alive.current = false;
+      if (t) clearInterval(t);
+    };
+  }, [refresh, opts.pollMs]);
 
-  delete<T>(
-    path: string,
-    options?: RequestOptions,
-  ) {
-    return request<T>(path, {
-      ...options,
-      method: "DELETE",
-    });
-  },
-};
+  return { data, error, loading, refresh };
+}

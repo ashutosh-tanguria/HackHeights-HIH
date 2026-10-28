@@ -1,20 +1,22 @@
 {
-  "name": "oosc-agent-reliability",
-  "version": "0.1.0",
+  "name": "bayora",
+  "version": "1.0.0",
+  "description": "Bayora: isolated infrastructure for adversarial AI safety testing (Hack in Hills, PS-04)",
   "private": true,
   "packageManager": "pnpm@10.15.0",
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
+    "setup": "node scripts/setup-env.mjs",
     "dev": "turbo dev",
     "build": "turbo build",
-    "lint": "turbo lint",
     "typecheck": "turbo typecheck",
-    "test": "turbo test",
-    "format": "prettier --write .",
-    "seed": "tsx scripts/seed.ts",
+    "test": "pnpm --filter @oosc/api test",
+    "verify": "pnpm install && pnpm typecheck && pnpm test && pnpm build",
     "demo": "tsx scripts/demo.ts",
-    "mock-agent": "node mock-agent.js",
-    "verify:gateway": "node scripts/verify-gateway.mjs",
-    "verify:gateway:py": "python scripts/verify-gateway.py"
+    "fetch:datasets": "node scripts/fetch-datasets.mjs",
+    "verify:bundle": "node scripts/verify-bundle.mjs"
   },
   "devDependencies": {
     "prettier": "^3.6.2",
