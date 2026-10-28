@@ -1,0 +1,9 @@
+{
+  "name": "@oosc/example-customer-support-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Example customer support agent for OOSC reliability evaluations",
+  "scripts": {
+    "start": "node agent.js"
+  }
+}

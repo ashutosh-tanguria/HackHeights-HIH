@@ -1,0 +1,25 @@
+{
+  "name": "oosc-agent-reliability",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.15.0",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "test": "turbo test",
+    "format": "prettier --write .",
+    "seed": "tsx scripts/seed.ts",
+    "demo": "tsx scripts/demo.ts",
+    "mock-agent": "node mock-agent.js",
+    "verify:gateway": "node scripts/verify-gateway.mjs",
+    "verify:gateway:py": "python scripts/verify-gateway.py"
+  },
+  "devDependencies": {
+    "prettier": "^3.6.2",
+    "tsx": "^4.19.2",
+    "turbo": "^2.5.6",
+    "typescript": "^5.9.2"
+  }
+}

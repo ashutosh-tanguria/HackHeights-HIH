@@ -1,0 +1,9 @@
+{
+  "name": "@oosc/example-hallucination-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Example hallucination agent for testing OOSC failure detection",
+  "scripts": {
+    "start": "node agent.js"
+  }
+}

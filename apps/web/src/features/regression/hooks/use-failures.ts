@@ -1,0 +1,1 @@
+export { useFailures } from "@/features/failures/hooks/use-failures";
