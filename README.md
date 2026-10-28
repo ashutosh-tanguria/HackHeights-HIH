@@ -70,7 +70,7 @@ flowchart LR
 Requirements: Docker Desktop running, Node.js 22.5 or newer, pnpm 10 (`corepack enable`).
 
 ```powershell
-cd "Bayora - Ashutosh"
+cd "HackHeights-HIH-main"
 pnpm install
 pnpm setup                                   # creates .env with random secrets (never committed)
 
